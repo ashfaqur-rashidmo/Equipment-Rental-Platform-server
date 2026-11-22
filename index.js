@@ -15,18 +15,14 @@ const stripe = process.env.STRIPE_SECRET_KEY
 
 const client = new MongoClient(process.env.MONGODB_URI);
 
-const myLogger = async (req, res, next) => {
-  console.log("Now Hitting API:", req.url,req.query,req.headers);
-  next();
-}
-
 export async function connectToMongoDB() {
   try {
     await client.connect();
     console.log("You successfully connected to MongoDB!");
     return client;
   } catch (err) {
-    console.dir(err);
+    console.error("Failed to connect to MongoDB:", err);
+    throw err;
   }
 }
 
@@ -307,7 +303,8 @@ const verifyAdmin = (req, res, next) => {
   next();
 };
 
-app.get("/users", async (req, res) => {
+// Users are only exposed through the admin endpoints.
+app.get("/users", verifyAdmin, async (req, res) => {
     const usersData = users.find({});
     const usersArray = await usersData.toArray();
     res.send(usersArray);
@@ -488,14 +485,14 @@ app.get("/equipment/:id", async (req, res) => {
 // GET /rentals?userId=... — bookings of one customer, newest first
 app.get("/rentals",verifyToken, verifyRenter, async (req, res) => {
   try {
-    const { userId } = req.query;
+    const userId = String(req.user?.id || "");
 
     if (!userId) {
       return res.status(400).send({ error: "userId is required" });
     }
 
     const list = await rentals
-      .find({ customerId: String(userId) })
+      .find({ customerId: userId })
       .sort({ bookingDate: -1 })
       .toArray();
 
@@ -538,8 +535,12 @@ app.get("/owner/rentals", verifyToken, verifyOwner, async (req, res) => {
       return res.status(400).send({ error: "ownerId is required" });
     }
 
+    // Always scope the query to the caller's own owner id — a passed
+    // value cannot widen visibility to other owners' rentals.
+    const scopedOwnerId = String(req.user?.id || ownerId);
+
     const ownerEquipmentIds = await equipments
-      .find({ ownerId: String(ownerId) }, { projection: { _id: 1 } })
+      .find({ ownerId: String(scopedOwnerId) }, { projection: { _id: 1 } })
       .toArray();
 
     const equipmentIdList = ownerEquipmentIds.map((item) => item._id.toString());
@@ -564,6 +565,20 @@ app.patch("/rentals/:id", verifyToken, verifyCustomerOrAdmin, async (req, res) =
     const { id } = req.params;
 
     if (!ObjectId.isValid(id)) {
+      return res.status(404).send({ error: "Booking not found" });
+    }
+
+    const booking = await rentals.findOne({ _id: new ObjectId(id) });
+    if (!booking) {
+      return res.status(404).send({ error: "Booking not found" });
+    }
+
+    // A customer may update only their own bookings; Admins are allowed
+    // to update every booking (see verifyCustomerOrAdmin).
+    if (
+      String(booking.customerId) !== String(req.user?.id) &&
+      req.user.role !== "Admin"
+    ) {
       return res.status(404).send({ error: "Booking not found" });
     }
 
@@ -619,6 +634,13 @@ app.post("/rentals", verifyToken, verifyRenter, async (req, res) => {
       });
     }
 
+    // A customer cannot book equipment on behalf of another account.
+    if (String(customerId) !== String(req.user?.id)) {
+      return res.status(403).send({
+        error: "You can only book equipment for your own account.",
+      });
+    }
+
     const start = new Date(startDate);
     const end = new Date(endDate);
 
@@ -654,12 +676,18 @@ app.post("/rentals", verifyToken, verifyRenter, async (req, res) => {
       });
     }
     const days = Math.max(1, Math.ceil((end.getTime() - start.getTime()) / 86400000));
-    const price = Number(rentalPrice) || 0;
 
-    // Price of the whole window, priced by the item's rental type.
+    // The equipment's canonical price is the source of truth — the
+    // client-supplied price is not used.
+    const price = Number(equipment.rentalPrice) || 0;
+
+    // Price of the whole window, priced by the item's rental type
+    // (values are stored capitalized, but tolerate other cases).
+    const rentalTypeValue =
+      typeof rentalType === "string" ? rentalType.toLowerCase() : "";
     let units = days;
-    if (rentalType === "Weekly") units = Math.ceil(days / 7);
-    if (rentalType === "Monthly") units = Math.ceil(days / 30);
+    if (rentalTypeValue === "weekly") units = Math.ceil(days / 7);
+    if (rentalTypeValue === "monthly") units = Math.ceil(days / 30);
 
     const rental = {
       equipmentId: String(equipmentId),
@@ -679,13 +707,29 @@ app.post("/rentals", verifyToken, verifyRenter, async (req, res) => {
       bookingDate: new Date(),
     };
 
-    const result = await rentals.insertOne(rental);
-
-    // Consume the booked quantity so later bookings see the reduced stock.
-    await equipments.updateOne(
-      { _id: equipment._id },
+    // Consume the booked quantity atomically so concurrent bookings
+    // cannot oversell. If another request took the stock first, say so.
+    const consumed = await equipments.findOneAndUpdate(
+      { _id: equipment._id, availableQuantity: { $gte: qty } },
       { $inc: { availableQuantity: -qty } }
     );
+    if (!consumed) {
+      return res.status(409).send({
+        error: `Only ${equipment.availableQuantity} unit(s) available to rent`,
+      });
+    }
+
+    let result;
+    try {
+      result = await rentals.insertOne(rental);
+    } catch (err) {
+      // Give the consumed stock back if the booking could not be saved.
+      await equipments.updateOne(
+        { _id: equipment._id },
+        { $inc: { availableQuantity: qty } }
+      );
+      throw err;
+    }
 
     res.status(201).send({ ...rental, _id: result.insertedId });
   } catch (err) {
@@ -702,7 +746,8 @@ const favorites = database.collection("favorite");
 // Returns the saved items with the current equipment record joined in.
 app.get("/favorites",verifyToken, verifyRenter, async (req, res) => {
   try {
-    const { userId, equipmentId } = req.query;
+    const userId = String(req.user?.id || "");
+    const equipmentId = req.query.equipmentId;
 
     if (!userId) {
       return res.status(400).send({ error: "userId is required" });
@@ -742,7 +787,8 @@ app.get("/favorites",verifyToken, verifyRenter, async (req, res) => {
 // POST /favorites — save an equipment to a customer's favorites
 app.post("/favorites", verifyToken, verifyRenter, async (req, res) => {
   try {
-    const { userId, equipmentId } = req.body;
+    const userId = String(req.user?.id || "");
+    const equipmentId = req.body?.equipmentId;
 
     if (!userId || !equipmentId || !ObjectId.isValid(equipmentId)) {
       return res.status(400).send({
@@ -785,7 +831,11 @@ app.delete("/favorites/:id", verifyToken, verifyRenter, async (req, res) => {
       return res.status(404).send({ error: "Favorite not found" });
     }
 
-    const result = await favorites.deleteOne({ _id: new ObjectId(id) });
+    // Only the owning customer can remove their own favorite.
+    const result = await favorites.deleteOne({
+      _id: new ObjectId(id),
+      userId: String(req.user?.id || ""),
+    });
 
     if (result.deletedCount === 0) {
       return res.status(404).send({ error: "Favorite not found" });
@@ -828,6 +878,13 @@ app.post("/payments", verifyToken,verifyRenter, async (req, res) => {
       });
     }
 
+    // A customer can only start a session for their own bookings.
+    if (String(rental.customerId) !== String(req.user?.id)) {
+      return res.status(404).send({
+        error: "Rental not found",
+      });
+    }
+
     // Check payment status
     if (rental.paymentStatus === "Paid") {
       return res.status(400).send({
@@ -856,7 +913,7 @@ app.post("/payments", verifyToken,verifyRenter, async (req, res) => {
             },
             unit_amount: Math.round(rental.totalAmount * 100),
           },
-          quantity: 1,
+          quantity: rental.quantity || 1,
         },
       ],
 
@@ -877,7 +934,7 @@ app.post("/payments", verifyToken,verifyRenter, async (req, res) => {
       equipmentName: rental.equipmentName,
       stripeSessionId: session.id,
       amount: rental.totalAmount,
-      currency: "usd",
+      currency: "BDT",
       paymentStatus: "Pending",
       transactionDate: new Date(),
     });
@@ -914,24 +971,54 @@ app.get("/payments", verifyToken, verifyAdmin, async (req, res) => {
 
 
 app.patch("/equipment/:id", verifyToken, verifyOwnerOrAdmin, async (req, res) => {
-  const { id } = req.params;
-  const updateData = {...req.body};
+  try {
+    const { id } = req.params;
 
-  delete updateData._id; 
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({ error: "Invalid equipment id." });
+    }
 
-  const result = await equipments.updateOne(
-    { _id: new ObjectId(id) },
-    { $set: updateData }
-  );
-  res.send(result);
+    const updateData = {...req.body};
+
+    delete updateData._id; 
+
+    const result = await equipments.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: updateData }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).send({ error: "Equipment not found" });
+    }
+
+    res.status(200).send(result);
+  } catch (err) {
+    console.error("Error updating equipment:", err);
+    res.status(500).send({ error: "Failed to update equipment" });
+  }
 });
 
 
 
 app.delete("/equipment/:id", verifyToken, verifyOwnerOrAdmin, async (req, res) => {
-  const { id } = req.params;
-  const result = await equipments.deleteOne({ _id: new ObjectId(id) });
-  res.send(result);
+  try {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({ error: "Invalid equipment id." });
+    }
+
+    const result = await equipments.deleteOne({ _id: new ObjectId(id) });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).send({ error: "Equipment not found" });
+    }
+
+    res.status(200).send(result);
+  } catch (err) {
+    console.error("Error deleting equipment:", err);
+    res.status(500).send({ error: "Failed to delete equipment" });
+  }
 });
 
 
