@@ -4,11 +4,7 @@ import dotenv from "dotenv";
 import { MongoClient, ObjectId } from 'mongodb';
 import Stripe from "stripe";
 import jwt from "jsonwebtoken";
-import { randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
-import {
-  startBookingStatusCron,
-  updateOverdueBookings,
-} from "./bookingStatusCron.js";
+import cron from "node-cron";
 
 dotenv.config();
 
@@ -39,8 +35,129 @@ const equipments = database.collection("equipment");
 const payments = database.collection("payments");
 const rentals = database.collection("rental");
 
-// Start the cron job (schedule and startup catch-up are configurable via env).
-startBookingStatusCron({ rentals, equipments });
+/* ==========================================================================
+   AUTOMATED BOOKING STATUS UPDATE  (optional requirement #3)
+
+   Every scheduled run:
+     1. finds bookings whose rental end date is already in the past,
+     2. changes their bookingStatus to "Completed",
+     3. returns the rented units to the equipment's availableQuantity.
+
+   Settings (all optional, set them in .env):
+     BOOKING_CRON_SCHEDULE      - cron expression, default "0 * * * *" (hourly)
+     BOOKING_CRON_TIMEZONE      - timezone, default "UTC"
+     BOOKING_CRON_RUN_ON_START  - set "false" to skip the startup catch-up run
+   ========================================================================== */
+
+const COMPLETED_STATUS = "Completed";
+// Completed / cancelled bookings are final and must never be touched again.
+const FINAL_STATUSES = /^(completed|cancelled)$/i;
+
+/** MongoDB query: rentals that ended before today and are still open. */
+function overdueBookingFilter(now = new Date()) {
+  // endDate is stored as a BSON Date at UTC midnight, so compare with UTC
+  // midnight: a rental ending "today" is completed only after today ends.
+  const startOfTodayUTC = new Date(
+    Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())
+  );
+  const dateOnly = startOfTodayUTC.toISOString().slice(0, 10); // for string dates
+
+  return {
+    $and: [
+      {
+        $or: [
+          { endDate: { $type: "date", $lt: startOfTodayUTC } },
+          { endDate: { $type: "string", $lt: dateOnly } },
+        ],
+      },
+      {
+        $or: [
+          { bookingStatus: { $exists: false } },
+          { bookingStatus: null },
+          { bookingStatus: { $not: FINAL_STATUSES } },
+        ],
+      },
+    ],
+  };
+}
+
+/** Complete every overdue booking and restock its equipment. */
+async function updateOverdueBookings() {
+  const now = new Date();
+  const filter = overdueBookingFilter(now);
+  const overdue = await rentals.find(filter).toArray();
+
+  let updated = 0;
+  let restocked = 0;
+
+  for (const rental of overdue) {
+    // Re-check the filter inside the update so a booking closed manually in
+    // the meantime is not updated or restocked twice.
+    const updatedDoc = await rentals.findOneAndUpdate(
+      { _id: rental._id, ...filter },
+      {
+        $set: {
+          bookingStatus: COMPLETED_STATUS,
+          completedAt: now,
+          updatedAt: now,
+        },
+      },
+      { returnDocument: "after" }
+    );
+    const doc = updatedDoc?.value ?? updatedDoc; // works with old and new Mongo drivers
+    if (!doc || String(doc.bookingStatus).toLowerCase() !== "completed") continue;
+    updated += 1;
+
+    const quantity = Number(rental.quantity) || 1;
+    const equipmentId = rental.equipmentId;
+    if (equipmentId && ObjectId.isValid(String(equipmentId)) && quantity > 0) {
+      const result = await equipments.updateOne(
+        { _id: new ObjectId(String(equipmentId)) },
+        { $inc: { availableQuantity: quantity } }
+      );
+      if (result.modifiedCount > 0) restocked += 1;
+    }
+  }
+
+  return { scanned: overdue.length, updated, restocked, at: now.toISOString() };
+}
+
+/** Register the schedule and (optionally) catch up once on startup. */
+function startBookingStatusCron() {
+  const schedule = process.env.BOOKING_CRON_SCHEDULE || "0 * * * *";
+  const timezone = process.env.BOOKING_CRON_TIMEZONE || "UTC";
+
+  if (!cron.validate(schedule)) {
+    throw new Error(`Invalid BOOKING_CRON_SCHEDULE: "${schedule}"`);
+  }
+
+  let running = false;
+  async function run(trigger) {
+    if (running) return; // skip overlapping runs
+    running = true;
+    try {
+      const result = await updateOverdueBookings();
+      console.log(
+        `[CRON] ${trigger}: scanned=${result.scanned} ` +
+          `completed=${result.updated} restocked=${result.restocked}`
+      );
+      return result;
+    } catch (err) {
+      console.error(`[CRON] ${trigger} failed:`, err);
+    } finally {
+      running = false;
+    }
+  }
+
+  cron.schedule(schedule, () => run("scheduled"), { timezone });
+  console.log(`[CRON] Booking status job scheduled: "${schedule}" (${timezone})`);
+
+  if (process.env.BOOKING_CRON_RUN_ON_START !== "false") {
+    setTimeout(() => run("startup"), 1000).unref?.();
+  }
+}
+
+startBookingStatusCron();
 
 const app = express();
 const port = process.env.PORT || 5000;
@@ -53,64 +170,7 @@ app.get("/", (req, res) => {
 });
 
 
-app.post("/api/auth/register", async (req, res) => {
-  try {
-    const { name, email, password, photo } = req.body || {};
 
-    if (!name || !email || !password) {
-      return res
-        .status(400)
-        .send({ error: "Name, email and password are required." });
-    }
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-      return res.status(400).send({ error: "Invalid email address." });
-    }
-    if (
-      !/[A-Z]/.test(password) ||
-      !/[a-z]/.test(password) ||
-      password.length < 6
-    ) {
-      return res.status(400).send({
-        error:
-          "Password must contain an uppercase letter, a lowercase letter and be at least 6 characters long.",
-      });
-    }
-
-    const existing = await users.findOne({ email });
-    if (existing) {
-      return res.status(400).send({ error: "Email already registered." });
-    }
-
-    const saltHex = randomBytes(16).toString("hex");
-    const newUser = {
-      name,
-      email,
-      passwordHash: hashPassword(password, saltHex),
-      passwordSalt: saltHex,
-      photo: photo || "",
-      role: "Customer",
-      createdAt: new Date(),
-      updatedAt: new Date(),
-    };
-
-    const result = await users.insertOne(newUser);
-    const token = issueToken(result.insertedId, newUser.email, "Customer");
-
-    res.status(201).send({
-      user: {
-        _id: result.insertedId,
-        name,
-        email,
-        photo: newUser.photo,
-        role: "Customer",
-      },
-      token,
-    });
-  } catch (err) {
-    console.error("Error registering user:", err);
-    res.status(500).send({ error: "Failed to register user." });
-  }
-});
 
 app.post("/api/auth/login", async (req, res) => {
   try {
@@ -148,79 +208,8 @@ app.post("/api/auth/login", async (req, res) => {
   }
 });
 
-app.post("/api/auth/google-login", async (req, res) => {
-  try {
-    const { idToken } = req.body || {};
-    if (!idToken) {
-      return res.status(400).send({ error: "Google ID token is required." });
-    }
-
-    const info = await fetch(
-      `https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(
-        idToken
-      )}`
-    ).then((r) => r.json());
-
-    if (!info || !info.email) {
-      return res.status(401).send({ error: "Invalid Google token." });
-    }
-
-    let user = await users.findOne({ email: info.email });
-    const isNew = !user;
-
-    if (isNew) {
-      const saltHex = randomBytes(16).toString("hex");
-      user = {
-        name: info.name || info.email.split("@")[0],
-        email: info.email,
-        photo: info.picture || "",
-        passwordHash: null,
-        passwordSalt: null,
-        role: "Customer",
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      };
-      const result = await users.insertOne(user);
-      user._id = result.insertedId;
-    }
-
-    const token = issueToken(user._id, user.email, user.role || "Customer");
-
-    res.status(isNew ? 201 : 200).send({
-      user: {
-        _id: user._id,
-        name: user.name,
-        email: user.email,
-        photo: user.photo || "",
-        role: user.role || "Customer",
-      },
-      token,
-    });
-  } catch (err) {
-    console.error("Google login error:", err);
-    res.status(500).send({ error: "Google login failed." });
-  }
-});
 
 
-const issueToken = (userId, email, role) =>
-  jwt.sign(
-    { id: String(userId), email, role },
-    process.env.JWT_SECRET,
-    { expiresIn: "7d" }
-  );
-
-const hashPassword = (password, saltHex) =>
-  scryptSync(password, Buffer.from(saltHex, "hex"), 32).toString("hex");
-
-const isValidPassword = (password, storedHash, storedSaltHex) => {
-  if (!storedHash || !storedSaltHex) return false;
-  const hash = hashPassword(password, storedSaltHex);
-  const a = Buffer.from(String(hash), "utf8");
-  const b = Buffer.from(String(storedHash), "utf8");
-  if (a.length !== b.length) return false;
-  return timingSafeEqual(a, b);
-};
 
 
 const verifyToken = async (req, res, next) => {
@@ -590,9 +579,24 @@ app.patch("/rentals/:id", verifyToken, verifyCustomerOrAdmin, async (req, res) =
     }
 
     const updates = {};
-    if (req.body.paymentStatus) {
-      updates.paymentStatus = String(req.body.paymentStatus);
+    const requestedPaymentStatus = req.body.paymentStatus
+      ? String(req.body.paymentStatus)
+      : "";
+    if (requestedPaymentStatus) {
+      updates.paymentStatus = requestedPaymentStatus;
     }
+
+    // A successful payment confirms a still-pending booking. This is done on
+    // the server so the status cannot be forgotten by a client, and a refresh
+    // of the success page can never downgrade an already Completed/Cancelled
+    // booking back to Confirmed.
+    if (
+      requestedPaymentStatus.toLowerCase() === "paid" &&
+      String(booking.bookingStatus || "").toLowerCase() === "pending"
+    ) {
+      updates.bookingStatus = "Confirmed";
+    }
+
     if (req.body.bookingStatus) {
       updates.bookingStatus = String(req.body.bookingStatus);
     }
@@ -907,6 +911,7 @@ app.post("/payments", verifyToken,verifyRenter, async (req, res) => {
     }
 
     // Create Stripe Checkout Session
+    const clientUrl = process.env.CLIENT_URL || "http://localhost:3000";
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
 
@@ -924,13 +929,14 @@ app.post("/payments", verifyToken,verifyRenter, async (req, res) => {
         },
       ],
 
+      client_reference_id: rental._id.toString(),
       metadata: {
         rentalId: rental._id.toString(),
       },
 
-      success_url: `${process.env.CLIENT_URL}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+      success_url: `${clientUrl}/success?session_id={CHECKOUT_SESSION_ID}`,
 
-      cancel_url: `${process.env.CLIENT_URL}/payment/cancel`,
+      cancel_url: `${clientUrl}/dashboard/customer/payment/${rental._id}`,
     });
 
     // Save payment information
@@ -959,6 +965,68 @@ app.post("/payments", verifyToken,verifyRenter, async (req, res) => {
   }
 });
 
+
+// POST /api/payments/record — called by the Stripe success page after the
+// session is verified. Marks the booking paid/confirmed and stores the
+// transaction exactly once (safe to call again when the page is refreshed).
+app.post("/api/payments/record", verifyToken, verifyRenter, async (req, res) => {
+  try {
+    const { rentalId, stripeSessionId, amount, currency } = req.body || {};
+    if (!rentalId || !ObjectId.isValid(rentalId) || !stripeSessionId) {
+      return res.status(400).send({
+        error: "Valid rentalId and stripeSessionId are required",
+      });
+    }
+
+    const rental = await rentals.findOne({ _id: new ObjectId(rentalId) });
+    if (!rental) {
+      return res.status(404).send({ error: "Rental not found" });
+    }
+    if (String(rental.customerId) !== String(req.user?.id)) {
+      return res.status(404).send({ error: "Rental not found" });
+    }
+
+    // Idempotency: one transaction per Stripe session.
+    const existing = await payments.findOne({
+      rentalId: String(rentalId),
+      stripeSessionId: String(stripeSessionId),
+    });
+    if (existing) {
+      return res.send({ created: false, payment: existing });
+    }
+
+    const paidAmount = Number(amount ?? rental.totalAmount);
+    if (!Number.isFinite(paidAmount) || paidAmount <= 0) {
+      return res.status(400).send({ error: "Invalid payment amount" });
+    }
+
+    const bookingUpdates = { paymentStatus: "Paid" };
+    if (String(rental.bookingStatus || "").toLowerCase() === "pending") {
+      bookingUpdates.bookingStatus = "Confirmed";
+    }
+    await rentals.updateOne({ _id: rental._id }, { $set: bookingUpdates });
+
+    const record = {
+      rentalId: String(rentalId),
+      customerId: String(rental.customerId),
+      equipmentId: String(rental.equipmentId || ""),
+      equipmentName: rental.equipmentName || "",
+      stripeSessionId: String(stripeSessionId),
+      amount: paidAmount,
+      currency: String(currency || "bdt"),
+      paymentStatus: "Paid",
+      transactionDate: new Date(),
+    };
+    const result = await payments.insertOne(record);
+    res.status(201).send({
+      created: true,
+      payment: { ...record, _id: result.insertedId },
+    });
+  } catch (err) {
+    console.error("Error recording payment:", err);
+    res.status(500).send({ error: "Failed to record payment" });
+  }
+});
 
 // GET all payment transactions
 app.get("/payments", verifyToken, verifyAdmin, async (req, res) => {
@@ -1135,7 +1203,7 @@ app.post(
   verifyAdmin,
   async (_req, res) => {
     try {
-      const result = await updateOverdueBookings(rentals, equipments);
+      const result = await updateOverdueBookings();
       res.status(200).send({
         message: "Booking status update completed",
         ...result,
