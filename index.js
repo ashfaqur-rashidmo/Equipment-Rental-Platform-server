@@ -34,6 +34,7 @@ const connectedClient = await connectToMongoDB();
 
 const database = connectedClient.db("equipment_rental_platform");
 const users = database.collection("user");
+const sessions = database.collection("session");
 const equipments = database.collection("equipment");
 const payments = database.collection("payments");
 const rentals = database.collection("rental");
@@ -48,7 +49,7 @@ app.get("/", (req, res) => {
   res.send(" Rental Platform Server is running");
 });
 
-// ---- JWT auth endpoints ----
+
 app.post("/api/auth/register", async (req, res) => {
   try {
     const { name, email, password, photo } = req.body || {};
@@ -199,7 +200,6 @@ app.post("/api/auth/google-login", async (req, res) => {
 });
 
 
- // ---- JWT + password helpers ----
 const issueToken = (userId, email, role) =>
   jwt.sign(
     { id: String(userId), email, role },
@@ -219,9 +219,8 @@ const isValidPassword = (password, storedHash, storedSaltHex) => {
   return timingSafeEqual(a, b);
 };
 
-// Extracts the Bearer token, verifies it with JWT_SECRET and sets
-// req.user = { id, email, role } before calling next().
-const verifyToken = (req, res, next) => {
+
+const verifyToken = async (req, res, next) => {
   const header = req.headers.authorization;
   const token =
     header && header.toLowerCase().startsWith("bearer ")
@@ -232,12 +231,37 @@ const verifyToken = (req, res, next) => {
     return res.status(401).send({ error: "Unauthorized" });
   }
 
+ 
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
     req.user = decoded;
-    next();
+    return next();
+  } catch {
+  }
+
+  try {
+    const sessionDoc = await sessions.findOne({
+      token,
+      expiresAt: { $gt: new Date() },
+    });
+    if (!sessionDoc) {
+      return res.status(401).send({ error: "Unauthorized" });
+    }
+
+    const userId =
+      sessionDoc.userId instanceof ObjectId
+        ? sessionDoc.userId
+        : new ObjectId(sessionDoc.userId);
+    const userDoc = await users.findOne({ _id: userId });
+    if (!userDoc) {
+      return res.status(401).send({ error: "Unauthorized" });
+    }
+
+    req.user = { ...userDoc, id: userDoc._id.toString() };
+    return next();
   } catch (err) {
-    return res.status(401).send({ error: "Invalid or expired token" });
+    console.error("Session token verification failed:", err);
+    return res.status(401).send({ error: "Unauthorized" });
   }
 };
 
@@ -377,8 +401,7 @@ app.get("/equipment", async (req, res) => {
 
 
 
-// Distinct categories with counts, faceted by every active filter
-// except `category` itself (so the list never collapses to one row).
+
 app.get("/equipment/categories", async (req, res) => {
   try {
     const rest = { ...req.query };
@@ -501,6 +524,7 @@ app.get("/owner/rentals", verifyToken, verifyOwner, async (req, res) => {
     res.status(500).send({ error: "Failed to fetch owner rentals" });
   }
 });
+
 
 
 // PATCH /rentals/:id — update payment/booking status (e.g. after Stripe payment)
