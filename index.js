@@ -279,6 +279,27 @@ const verifyOwner = (req, res, next) => {
   next();
 };
 
+
+const verifyOwnerOrAdmin = (req, res, next) => {
+  if (!req.user || !["Owner", "Admin"].includes(req.user.role)) {
+    return res.status(403).send({
+      error: "Owner or Admin access required",
+    });
+  }
+  next();
+};
+
+// The Admin dashboard's All Rentals page edits the payment and booking
+// status of every booking, so Admins are allowed as well as Customers.
+const verifyCustomerOrAdmin = (req, res, next) => {
+  if (!req.user || !["Customer", "Admin"].includes(req.user.role)) {
+    return res.status(403).send({
+      error: "Customer or Admin access required",
+    });
+  }
+  next();
+};
+
 const verifyAdmin = (req, res, next) => {
   if (!req.user || req.user.role !== "Admin") {
     return res.status(403).send({ error: "Admin access only" });
@@ -385,9 +406,19 @@ app.get("/equipment", async (req, res) => {
   try {
     const query = buildEquipmentQuery(req.query);
 
+    // Sort support for the All Equipment page:
+    // priceLow | priceHigh | recent (default).
+    const sortParam = String(req.query.sort || "recent").toLowerCase();
+    const sortMap = {
+      pricelow: { rentalPrice: 1, _id: 1 },
+      pricehigh: { rentalPrice: -1, _id: -1 },
+      recent: { createdAt: -1, _id: -1 },
+    };
+    const sort = sortMap[sortParam] || sortMap.recent;
+
     const equipmentArray = await equipments
       .find(query)
-      .sort({ createdAt: -1 })
+      .sort(sort)
       .toArray();
 
     res.status(200).send(equipmentArray);
@@ -528,7 +559,7 @@ app.get("/owner/rentals", verifyToken, verifyOwner, async (req, res) => {
 
 
 // PATCH /rentals/:id — update payment/booking status (e.g. after Stripe payment)
-app.patch("/rentals/:id", verifyToken, verifyRenter, async (req, res) => {
+app.patch("/rentals/:id", verifyToken, verifyCustomerOrAdmin, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -882,7 +913,7 @@ app.get("/payments", verifyToken, verifyAdmin, async (req, res) => {
 
 
 
-app.patch("/equipment/:id", verifyToken, verifyOwner, async (req, res) => {
+app.patch("/equipment/:id", verifyToken, verifyOwnerOrAdmin, async (req, res) => {
   const { id } = req.params;
   const updateData = {...req.body};
 
@@ -897,7 +928,7 @@ app.patch("/equipment/:id", verifyToken, verifyOwner, async (req, res) => {
 
 
 
-app.delete("/equipment/:id", verifyToken, verifyOwner, async (req, res) => {
+app.delete("/equipment/:id", verifyToken, verifyOwnerOrAdmin, async (req, res) => {
   const { id } = req.params;
   const result = await equipments.deleteOne({ _id: new ObjectId(id) });
   res.send(result);
