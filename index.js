@@ -428,9 +428,9 @@ app.get("/equipment/categories", async (req, res) => {
 });
 
 
-// Single equipment item by id
-app.get("/equipment/:id",verifyToken, async (req, res) => {
-  console.log("headers on the server", req.headers);
+// Single equipment item by id — public: the equipment listing pages are
+// browsable without an account, so the details page must be too.
+app.get("/equipment/:id", async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -595,7 +595,33 @@ app.post("/rentals", verifyToken, verifyRenter, async (req, res) => {
       return res.status(400).send({ error: "Invalid rental dates" });
     }
 
+    // The equipment must exist and the booking must stay within stock.
+    if (!ObjectId.isValid(equipmentId)) {
+      return res.status(400).send({ error: "Invalid equipmentId" });
+    }
+
+    const equipment = await equipments.findOne({
+      _id: new ObjectId(equipmentId),
+    });
+
+    if (!equipment) {
+      return res.status(404).send({ error: "Equipment not found" });
+    }
+
     const qty = Math.max(1, Number(quantity) || 1);
+
+    if (
+      !Number.isInteger(equipment.availableQuantity) ||
+      equipment.availableQuantity <= 0
+    ) {
+      return res.status(400).send({ error: "Equipment is out of stock" });
+    }
+
+    if (qty > equipment.availableQuantity) {
+      return res.status(400).send({
+        error: `Only ${equipment.availableQuantity} unit(s) available to rent`,
+      });
+    }
     const days = Math.max(1, Math.ceil((end.getTime() - start.getTime()) / 86400000));
     const price = Number(rentalPrice) || 0;
 
@@ -623,6 +649,12 @@ app.post("/rentals", verifyToken, verifyRenter, async (req, res) => {
     };
 
     const result = await rentals.insertOne(rental);
+
+    // Consume the booked quantity so later bookings see the reduced stock.
+    await equipments.updateOne(
+      { _id: equipment._id },
+      { $inc: { availableQuantity: -qty } }
+    );
 
     res.status(201).send({ ...rental, _id: result.insertedId });
   } catch (err) {
