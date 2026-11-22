@@ -5,6 +5,10 @@ import { MongoClient, ObjectId } from 'mongodb';
 import Stripe from "stripe";
 import jwt from "jsonwebtoken";
 import { randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
+import {
+  startBookingStatusCron,
+  updateOverdueBookings,
+} from "./bookingStatusCron.js";
 
 dotenv.config();
 
@@ -34,6 +38,9 @@ const sessions = database.collection("session");
 const equipments = database.collection("equipment");
 const payments = database.collection("payments");
 const rentals = database.collection("rental");
+
+// Start the cron job (schedule and startup catch-up are configurable via env).
+startBookingStatusCron({ rentals, equipments });
 
 const app = express();
 const port = process.env.PORT || 5000;
@@ -1119,6 +1126,26 @@ app.get("/admin/rentals", verifyToken, verifyAdmin, async (req, res) => {
   }
 });
 
+
+// Manually run the overdue-booking sweep (handy for testing or when the
+// long-running cron process is not available).
+app.post(
+  "/api/cron/update-booking-status",
+  verifyToken,
+  verifyAdmin,
+  async (_req, res) => {
+    try {
+      const result = await updateOverdueBookings(rentals, equipments);
+      res.status(200).send({
+        message: "Booking status update completed",
+        ...result,
+      });
+    } catch (err) {
+      console.error("Error updating booking statuses:", err);
+      res.status(500).send({ error: "Failed to update booking statuses" });
+    }
+  }
+);
 
 // get data from equipment database of the approval by admin
 app.get("/featured-equipment", async (req, res) => {
