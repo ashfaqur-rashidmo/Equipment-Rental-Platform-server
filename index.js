@@ -8,10 +8,7 @@ import cron from "node-cron";
 
 dotenv.config();
 
-const stripe = process.env.STRIPE_SECRET_KEY
-  ? Stripe(process.env.STRIPE_SECRET_KEY)
-  : null;
-    
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 const client = new MongoClient(process.env.MONGODB_URI);
 
