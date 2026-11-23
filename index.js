@@ -32,28 +32,14 @@ const equipments = database.collection("equipment");
 const payments = database.collection("payments");
 const rentals = database.collection("rental");
 
-/* ==========================================================================
-   AUTOMATED BOOKING STATUS UPDATE  (optional requirement #3)
-
-   Every scheduled run:
-     1. finds bookings whose rental end date is already in the past,
-     2. changes their bookingStatus to "Completed",
-     3. returns the rented units to the equipment's availableQuantity.
-
-   Settings (all optional, set them in .env):
-     BOOKING_CRON_SCHEDULE      - cron expression, default "0 * * * *" (hourly)
-     BOOKING_CRON_TIMEZONE      - timezone, default "UTC"
-     BOOKING_CRON_RUN_ON_START  - set "false" to skip the startup catch-up run
-   ========================================================================== */
 
 const COMPLETED_STATUS = "Completed";
-// Completed / cancelled bookings are final and must never be touched again.
+
 const FINAL_STATUSES = /^(completed|cancelled)$/i;
 
-/** MongoDB query: rentals that ended before today and are still open. */
+
 function overdueBookingFilter(now = new Date()) {
-  // endDate is stored as a BSON Date at UTC midnight, so compare with UTC
-  // midnight: a rental ending "today" is completed only after today ends.
+ 
   const startOfTodayUTC = new Date(
     Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())
   );
@@ -88,8 +74,7 @@ async function updateOverdueBookings() {
   let restocked = 0;
 
   for (const rental of overdue) {
-    // Re-check the filter inside the update so a booking closed manually in
-    // the meantime is not updated or restocked twice.
+
     const updatedDoc = await rentals.findOneAndUpdate(
       { _id: rental._id, ...filter },
       {
@@ -119,7 +104,6 @@ async function updateOverdueBookings() {
   return { scanned: overdue.length, updated, restocked, at: now.toISOString() };
 }
 
-/** Register the schedule and (optionally) catch up once on startup. */
 function startBookingStatusCron() {
   const schedule = process.env.BOOKING_CRON_SCHEDULE || "0 * * * *";
   const timezone = process.env.BOOKING_CRON_TIMEZONE || "UTC";
@@ -165,47 +149,6 @@ app.use(cors());
 app.get("/", (req, res) => {
   res.send(" Rental Platform Server is running");
 });
-
-
-
-
-app.post("/api/auth/login", async (req, res) => {
-  try {
-    const { email, password } = req.body || {};
-
-    if (!email || !password) {
-      return res
-        .status(400)
-        .send({ error: "Email and password are required." });
-    }
-
-    const user = await users.findOne({ email });
-    if (
-      !user ||
-      !isValidPassword(password, user.passwordHash, user.passwordSalt)
-    ) {
-      return res.status(401).send({ error: "Invalid email or password." });
-    }
-
-    const token = issueToken(user._id, user.email, user.role || "Customer");
-
-    res.send({
-      user: {
-        _id: user._id,
-        name: user.name,
-        email: user.email,
-        photo: user.photo || "",
-        role: user.role || "Customer",
-      },
-      token,
-    });
-  } catch (err) {
-    console.error("Error logging in:", err);
-    res.status(500).send({ error: "Failed to log in." });
-  }
-});
-
-
 
 
 
@@ -318,86 +261,11 @@ app.post("/add-equipment",verifyToken,verifyOwner, async (req, res) => {
 
 
 
-
-// Escape user input before it is used inside a $regex pattern.
-const escapeRegExp = (value) =>
-  String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-
-const toFiniteNumber = (value) => {
-  if (value === undefined || value === null || value === "") return null;
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : null;
-};
-
-
-function buildEquipmentQuery(params) {
-  const query = {};
-  const { search, name, location, category, rentalType, minPrice, maxPrice, available } =
-    params;
-
-  // Search by equipment name or location (single search term, case-insensitive)
-  if (search) {
-    const searchRegex = { $regex: escapeRegExp(search), $options: "i" };
-    query.$or = [{ name: searchRegex }, { location: searchRegex }];
-  }
-
-  // Search by equipment name (case-insensitive)
-  if (name) {
-    query.name = { $regex: escapeRegExp(name), $options: "i" };
-  }
-
-  // Search by location (case-insensitive)
-  if (location) {
-    query.location = { $regex: escapeRegExp(location), $options: "i" };
-  }
-
-  // Category filter. Matched on the leading word so that the site's
-  // "Photography Equipment" also matches a stored value of "Photography".
-  if (category) {
-    const leadingWord = String(category).trim().split(/\s+/)[0] || category;
-    query.category = {
-      $regex: `^${escapeRegExp(leadingWord)}`,
-      $options: "i",
-    };
-  }
-
-  // Rental type filter (Daily / Weekly / Monthly), exact but case-insensitive
-  if (rentalType) {
-    query.rentalType = {
-      $regex: `^${escapeRegExp(rentalType)}$`,
-      $options: "i",
-    };
-  }
-
-  // Price range filter
-  const priceFilter = {};
-  const min = toFiniteNumber(minPrice);
-  const max = toFiniteNumber(maxPrice);
-
-  if (min !== null) priceFilter.$gte = min;
-  if (max !== null) priceFilter.$lte = max;
-
-  if (Object.keys(priceFilter).length > 0) {
-    query.rentalPrice = priceFilter;
-  }
-
-  // Availability filter
-  if (available === "1" || available === "true") {
-    query.availableQuantity = { $gt: 0 };
-  } else if (available === "0" || available === "false") {
-    query.availableQuantity = { $lte: 0 };
-  }
-
-  return query;
-}
-
 app.get("/equipment", async (req, res) => {
  
   try {
     const query = buildEquipmentQuery(req.query);
 
-    // Sort support for the All Equipment page:
-    // priceLow | priceHigh | recent (default).
     const sortParam = String(req.query.sort || "recent").toLowerCase();
     const sortMap = {
       pricelow: { rentalPrice: 1, _id: 1 },
