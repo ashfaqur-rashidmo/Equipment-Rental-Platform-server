@@ -264,8 +264,6 @@ app.post("/add-equipment",verifyToken,verifyOwner, async (req, res) => {
 app.get("/equipment", async (req, res) => {
  
   try {
-    const query = buildEquipmentQuery(req.query);
-
     const sortParam = String(req.query.sort || "recent").toLowerCase();
     const sortMap = {
       pricelow: { rentalPrice: 1, _id: 1 },
@@ -275,7 +273,7 @@ app.get("/equipment", async (req, res) => {
     const sort = sortMap[sortParam] || sortMap.recent;
 
     const equipmentArray = await equipments
-      .find(query)
+      .find({})
       .sort(sort)
       .toArray();
 
@@ -293,14 +291,8 @@ app.get("/equipment", async (req, res) => {
 
 app.get("/equipment/categories", async (req, res) => {
   try {
-    const rest = { ...req.query };
-    delete rest.category;
-
-    const query = buildEquipmentQuery(rest);
-
     const rows = await equipments
       .aggregate([
-        { $match: query },
         { $group: { _id: "$category", count: { $sum: 1 } } },
         { $match: { _id: { $nin: [null, ""] } } },
         { $sort: { _id: 1 } },
